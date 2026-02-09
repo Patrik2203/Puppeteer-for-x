@@ -1,0 +1,16 @@
+{
+  "name": "twitter-puppeteer-service",
+  "version": "1.0.0",
+  "description": "Self-hosted Puppeteer service for Twitter automation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^21.6.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
