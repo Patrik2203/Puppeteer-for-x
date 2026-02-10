@@ -1,4 +1,5 @@
-// server.js - Advanced Twitter Automation with Cookie Management & OTP Support
+// server.js - Adaptive Twitter Automation with Dynamic Flow Detection
+// Handles: username → email → password → OTP in ANY order
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -11,80 +12,116 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const COOKIES_PATH = path.join(__dirname, 'twitter-cookies.json');
 
-// In-memory storage for pending OTP sessions
-const pendingOTPSessions = new Map();
+// In-memory storage for pending sessions
+const pendingSessions = new Map();
 
-// Load cookies from file
+// Load/Save cookies
 async function loadCookies() {
   try {
     const cookiesString = await fs.readFile(COOKIES_PATH, 'utf8');
     return JSON.parse(cookiesString);
   } catch (error) {
-    console.log('No saved cookies found');
     return null;
   }
 }
 
-// Save cookies to file
 async function saveCookies(cookies) {
   await fs.writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2));
-  console.log('Cookies saved successfully');
+  console.log('✅ Cookies saved');
+}
+
+// Detect what Twitter is asking for
+async function detectCurrentStep(page) {
+  const pageText = await page.evaluate(() => document.body.innerText.toLowerCase());
+  const pageHTML = await page.content();
+  
+  // Check for different input types
+  const hasUsernameInput = await page.$('input[autocomplete="username"]') !== null;
+  const hasPasswordInput = await page.$('input[name="password"]') !== null;
+  const hasTextInput = await page.$('input[data-testid="ocfEnterTextTextInput"]') !== null;
+  const hasEmailPrompt = pageText.includes('email') || pageText.includes('enter your phone');
+  const hasOTPPrompt = pageText.includes('verification code') || pageText.includes('we sent you a code');
+  const hasCaptcha = pageHTML.includes('captcha') || pageHTML.includes('recaptcha');
+  const isLoggedIn = await page.$('[data-testid="SideNav_NewTweet_Button"]') !== null;
+  
+  // Determine step
+  if (isLoggedIn) {
+    return { step: 'LOGGED_IN' };
+  }
+  
+  if (hasCaptcha) {
+    return { step: 'CAPTCHA', message: 'CAPTCHA detected - cannot proceed automatically' };
+  }
+  
+  if (hasUsernameInput) {
+    return { step: 'USERNAME', selector: 'input[autocomplete="username"]' };
+  }
+  
+  if (hasPasswordInput) {
+    return { step: 'PASSWORD', selector: 'input[name="password"]' };
+  }
+  
+  if (hasOTPPrompt && hasTextInput) {
+    return { step: 'OTP', selector: 'input[data-testid="ocfEnterTextTextInput"]' };
+  }
+  
+  if (hasEmailPrompt && hasTextInput) {
+    return { step: 'EMAIL', selector: 'input[data-testid="ocfEnterTextTextInput"]' };
+  }
+  
+  // Unknown state
+  return { 
+    step: 'UNKNOWN', 
+    pageText: pageText.substring(0, 500),
+    availableInputs: {
+      hasUsernameInput,
+      hasPasswordInput,
+      hasTextInput,
+      hasEmailPrompt,
+      hasOTPPrompt
+    }
+  };
+}
+
+// Click Next button
+async function clickNext(page) {
+  await page.evaluate(() => {
+    const buttons = Array.from(document.querySelectorAll('div[role="button"], button'));
+    const nextButton = buttons.find(btn => {
+      const text = btn.textContent?.trim().toLowerCase();
+      return text === 'next' || text === 'log in' || text === 'login';
+    });
+    if (nextButton) nextButton.click();
+  });
+  await page.waitForTimeout(4000);
+}
+
+// Fill input field
+async function fillInput(page, selector, value) {
+  const input = await page.waitForSelector(selector, { timeout: 5000, visible: true });
+  await input.click({ clickCount: 3 }); // Select all
+  await page.keyboard.press('Backspace'); // Clear
+  await input.type(value, { delay: 100 });
+  await page.waitForTimeout(1000);
 }
 
 // Health check
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Twitter Puppeteer Service with Cookie Management',
-    version: '2.0.0',
+    status: 'Twitter Automation Service - Adaptive Login v3.0',
+    version: '3.0.0',
+    features: ['Dynamic flow detection', 'Multi-step handling', 'Cookie persistence', 'OTP support'],
     endpoints: {
-      'GET /': 'Health check',
-      'GET /debug-twitter': 'Debug Twitter page loading',
-      'POST /login': 'Interactive login (handles email/OTP verification)',
-      'POST /provide-otp': 'Provide OTP code for pending session',
-      'POST /post-tweet': 'Post tweet (uses saved cookies)',
-      'GET /check-session': 'Check if cookies are valid',
-      'DELETE /logout': 'Clear saved cookies'
+      'POST /login': 'Start adaptive login flow',
+      'POST /continue-login': 'Continue login with required data (email/OTP)',
+      'POST /post-tweet': 'Post tweet (uses cookies)',
+      'GET /check-session': 'Verify cookie validity',
+      'DELETE /logout': 'Clear cookies'
     }
   });
 });
 
-// Debug endpoint
-app.get('/debug-twitter', async (req, res) => {
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-    
-    await page.goto('https://twitter.com/i/flow/login', { 
-      waitUntil: 'networkidle0',
-      timeout: 90000 
-    });
-    
-    const title = await page.title();
-    const url = page.url();
-    const content = await page.content();
-    
-    await browser.close();
-    
-    res.json({
-      success: true,
-      pageTitle: title,
-      pageUrl: url,
-      hasUsernameField: content.includes('autocomplete="username"'),
-      contentLength: content.length
-    });
-  } catch (error) {
-    if (browser) await browser.close();
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Interactive login with email/OTP support
+// Start adaptive login
 app.post('/login', async (req, res) => {
   const { username, password, email } = req.body;
 
@@ -99,7 +136,7 @@ app.post('/login', async (req, res) => {
   const sessionId = Date.now().toString();
   
   try {
-    console.log(`[${sessionId}] Starting login process...`);
+    console.log(`\n[${sessionId}] 🚀 Starting adaptive login...`);
     
     browser = await puppeteer.launch({
       headless: true,
@@ -107,263 +144,302 @@ app.post('/login', async (req, res) => {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process'
+        '--disable-blink-features=AutomationControlled'
       ]
     });
 
     const page = await browser.newPage();
-    
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
     });
-    
     await page.setViewport({ width: 1920, height: 1080 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
     });
 
-    console.log(`[${sessionId}] Navigating to Twitter login...`);
+    console.log(`[${sessionId}] 🌐 Loading Twitter...`);
     await page.goto('https://twitter.com/i/flow/login', { 
       waitUntil: 'networkidle0',
       timeout: 90000 
     });
     await page.waitForTimeout(3000);
 
-    // STEP 1: Enter username
-    console.log(`[${sessionId}] Entering username...`);
-    const usernameSelectors = [
-      'input[autocomplete="username"]',
-      'input[name="text"]',
-      'input[type="text"]'
-    ];
+    // Adaptive flow - handle up to 10 steps
+    let maxSteps = 10;
+    let currentStep = 0;
+    const credentials = { username, password, email };
     
-    let usernameInput;
-    for (const selector of usernameSelectors) {
-      try {
-        usernameInput = await page.waitForSelector(selector, { timeout: 5000, visible: true });
-        if (usernameInput) break;
-      } catch (e) {}
-    }
-    
-    if (!usernameInput) {
-      throw new Error('Username input not found');
-    }
-    
-    await usernameInput.type(username, { delay: 100 });
-    await page.waitForTimeout(1000);
-
-    // Click Next
-    console.log(`[${sessionId}] Clicking Next...`);
-    await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
-      const nextButton = buttons.find(btn => btn.textContent && btn.textContent.trim() === 'Next');
-      if (nextButton) nextButton.click();
-    });
-    await page.waitForTimeout(4000);
-
-    // STEP 2: Check what Twitter is asking for
-    const pageText = await page.evaluate(() => document.body.innerText);
-    console.log(`[${sessionId}] Checking page content...`);
-
-    // Case 1: Email verification
-    if (pageText.includes('Enter your email') || pageText.includes('Enter your phone number')) {
-      console.log(`[${sessionId}] Email/phone verification detected`);
+    while (currentStep < maxSteps) {
+      currentStep++;
+      console.log(`\n[${sessionId}] 📍 Step ${currentStep}: Detecting...`);
       
-      if (!email) {
+      const detected = await detectCurrentStep(page);
+      console.log(`[${sessionId}] ➡️  Detected: ${detected.step}`);
+      
+      if (detected.step === 'LOGGED_IN') {
+        console.log(`[${sessionId}] ✅ Login successful!`);
+        const cookies = await page.cookies();
+        await saveCookies(cookies);
+        await browser.close();
+        
+        return res.json({
+          success: true,
+          message: 'Login successful! Cookies saved.',
+          steps: currentStep,
+          cookiesCount: cookies.length
+        });
+      }
+      
+      if (detected.step === 'CAPTCHA') {
         await browser.close();
         return res.status(400).json({
           success: false,
-          requiresEmail: true,
-          message: 'Twitter is asking for email verification. Please provide email in the request body.'
+          error: 'CAPTCHA detected',
+          message: 'Twitter is showing CAPTCHA. Please login manually in a browser first to verify you\'re human.',
+          step: detected.step
         });
       }
-
-      const emailInput = await page.waitForSelector('input[data-testid="ocfEnterTextTextInput"]', { timeout: 5000 });
-      await emailInput.type(email, { delay: 100 });
-      await page.waitForTimeout(1000);
-
-      // Click Next
-      await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
-        const nextButton = buttons.find(btn => btn.textContent && btn.textContent.trim() === 'Next');
-        if (nextButton) nextButton.click();
-      });
-      await page.waitForTimeout(4000);
-    }
-
-    // STEP 3: Check for OTP request
-    const pageText2 = await page.evaluate(() => document.body.innerText);
-    
-    if (pageText2.includes('verification code') || pageText2.includes('Enter the code')) {
-      console.log(`[${sessionId}] OTP verification detected - waiting for code...`);
       
-      // Store session for OTP input
-      pendingOTPSessions.set(sessionId, { browser, page, username, password });
+      if (detected.step === 'USERNAME') {
+        console.log(`[${sessionId}] 👤 Entering username...`);
+        await fillInput(page, detected.selector, credentials.username);
+        await clickNext(page);
+        continue;
+      }
       
-      // Set timeout to clean up after 5 minutes
-      setTimeout(() => {
-        if (pendingOTPSessions.has(sessionId)) {
-          console.log(`[${sessionId}] Session timeout - cleaning up`);
-          pendingOTPSessions.delete(sessionId);
-          browser.close();
+      if (detected.step === 'PASSWORD') {
+        console.log(`[${sessionId}] 🔐 Entering password...`);
+        await fillInput(page, detected.selector, credentials.password);
+        await clickNext(page);
+        continue;
+      }
+      
+      if (detected.step === 'EMAIL') {
+        if (!credentials.email) {
+          // Save session for continuation
+          pendingSessions.set(sessionId, { browser, page, credentials });
+          setTimeout(() => {
+            if (pendingSessions.has(sessionId)) {
+              pendingSessions.delete(sessionId);
+              browser.close();
+            }
+          }, 300000); // 5 min timeout
+          
+          return res.json({
+            success: false,
+            needsEmail: true,
+            sessionId: sessionId,
+            message: 'Twitter is asking for email verification',
+            instruction: 'Use POST /continue-login with: { "sessionId": "' + sessionId + '", "email": "your@email.com" }'
+          });
         }
-      }, 300000);
+        
+        console.log(`[${sessionId}] 📧 Entering email...`);
+        await fillInput(page, detected.selector, credentials.email);
+        await clickNext(page);
+        continue;
+      }
       
-      return res.json({
-        success: false,
-        requiresOTP: true,
-        sessionId: sessionId,
-        message: 'Twitter sent OTP to your email/phone. Use POST /provide-otp with sessionId and otp code.',
-        nextStep: `POST /provide-otp with body: { "sessionId": "${sessionId}", "otp": "YOUR_CODE" }`
-      });
+      if (detected.step === 'OTP') {
+        // Save session for OTP input
+        pendingSessions.set(sessionId, { browser, page, credentials });
+        setTimeout(() => {
+          if (pendingSessions.has(sessionId)) {
+            pendingSessions.delete(sessionId);
+            browser.close();
+          }
+        }, 300000);
+        
+        return res.json({
+          success: false,
+          needsOTP: true,
+          sessionId: sessionId,
+          message: 'Twitter sent a verification code to your email/phone',
+          instruction: 'Use POST /continue-login with: { "sessionId": "' + sessionId + '", "otp": "123456" }'
+        });
+      }
+      
+      if (detected.step === 'UNKNOWN') {
+        console.log(`[${sessionId}] ❓ Unknown step detected`);
+        console.log('Page text:', detected.pageText);
+        
+        // Save session in case user can provide solution
+        pendingSessions.set(sessionId, { browser, page, credentials });
+        setTimeout(() => {
+          if (pendingSessions.has(sessionId)) {
+            pendingSessions.delete(sessionId);
+            browser.close();
+          }
+        }, 300000);
+        
+        return res.json({
+          success: false,
+          needsInput: true,
+          sessionId: sessionId,
+          unknownStep: true,
+          pageText: detected.pageText,
+          availableInputs: detected.availableInputs,
+          message: 'Twitter is asking for something unexpected',
+          instruction: 'Check pageText to see what Twitter is asking for'
+        });
+      }
+      
+      // Safety: if we reach here, wait a bit before next iteration
+      await page.waitForTimeout(2000);
     }
-
-    // STEP 4: Enter password
-    console.log(`[${sessionId}] Entering password...`);
     
-    const passwordInput = await page.waitForSelector('input[name="password"]', { timeout: 10000, visible: true });
-    await passwordInput.type(password, { delay: 100 });
-    await page.waitForTimeout(1000);
-
-    // Click Login
-    console.log(`[${sessionId}] Clicking Login...`);
-    await page.click('[data-testid="LoginForm_Login_Button"]');
-    await page.waitForTimeout(6000);
-
-    // STEP 5: Verify login success
-    console.log(`[${sessionId}] Verifying login...`);
-    const isLoggedIn = await page.evaluate(() => {
-      return document.querySelector('[data-testid="SideNav_NewTweet_Button"]') !== null;
-    });
-
-    if (!isLoggedIn) {
-      const currentUrl = page.url();
-      const errorText = await page.evaluate(() => document.body.innerText);
-      await browser.close();
-      return res.status(401).json({
-        success: false,
-        error: 'Login failed - check credentials',
-        currentUrl,
-        pageText: errorText.substring(0, 500)
-      });
-    }
-
-    // STEP 6: Save cookies
-    console.log(`[${sessionId}] Login successful! Saving cookies...`);
-    const cookies = await page.cookies();
-    await saveCookies(cookies);
-
+    // Max steps exceeded
     await browser.close();
-
-    res.json({
-      success: true,
-      message: 'Login successful! Cookies saved. You can now use /post-tweet endpoint.',
-      cookiesCount: cookies.length
+    return res.status(500).json({
+      success: false,
+      error: 'Max login steps exceeded',
+      message: 'Login process took too many steps. Please try again or login manually.'
     });
 
   } catch (error) {
-    console.error(`[${sessionId}] Login error:`, error.message);
+    console.error(`[${sessionId}] ❌ Error:`, error.message);
     if (browser) await browser.close();
     
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: error.message
     });
   }
 });
 
-// Provide OTP for pending session
-app.post('/provide-otp', async (req, res) => {
-  const { sessionId, otp } = req.body;
+// Continue login with email/OTP
+app.post('/continue-login', async (req, res) => {
+  const { sessionId, email, otp } = req.body;
 
-  if (!sessionId || !otp) {
+  if (!sessionId) {
     return res.status(400).json({
       success: false,
-      error: 'Missing sessionId or otp'
+      error: 'Missing sessionId'
     });
   }
 
-  const session = pendingOTPSessions.get(sessionId);
-  
+  const session = pendingSessions.get(sessionId);
   if (!session) {
     return res.status(404).json({
       success: false,
-      error: 'Session not found or expired. Please login again.'
+      error: 'Session not found or expired'
     });
   }
 
-  const { browser, page, password } = session;
+  const { browser, page, credentials } = session;
 
   try {
-    console.log(`[${sessionId}] Entering OTP: ${otp}`);
+    console.log(`\n[${sessionId}] 🔄 Continuing login...`);
     
-    // Enter OTP
-    const otpInput = await page.waitForSelector('input[data-testid="ocfEnterTextTextInput"]', { timeout: 5000 });
-    await otpInput.type(otp, { delay: 100 });
-    await page.waitForTimeout(1000);
-
-    // Click Next
-    await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
-      const nextButton = buttons.find(btn => btn.textContent && btn.textContent.trim() === 'Next');
-      if (nextButton) nextButton.click();
-    });
-    await page.waitForTimeout(4000);
-
-    // Check if password is now required
-    const pageText = await page.evaluate(() => document.body.innerText);
+    // Update credentials with new data
+    if (email) credentials.email = email;
+    if (otp) credentials.otp = otp;
     
-    if (pageText.includes('password') || pageText.includes('Password')) {
-      console.log(`[${sessionId}] Entering password after OTP...`);
+    // Continue adaptive flow
+    let maxSteps = 10;
+    let currentStep = 0;
+    
+    while (currentStep < maxSteps) {
+      currentStep++;
+      console.log(`\n[${sessionId}] 📍 Step ${currentStep}: Detecting...`);
       
-      const passwordInput = await page.waitForSelector('input[name="password"]', { timeout: 10000 });
-      await passwordInput.type(password, { delay: 100 });
-      await page.waitForTimeout(1000);
-
-      await page.click('[data-testid="LoginForm_Login_Button"]');
-      await page.waitForTimeout(6000);
+      const detected = await detectCurrentStep(page);
+      console.log(`[${sessionId}] ➡️  Detected: ${detected.step}`);
+      
+      if (detected.step === 'LOGGED_IN') {
+        console.log(`[${sessionId}] ✅ Login successful!`);
+        const cookies = await page.cookies();
+        await saveCookies(cookies);
+        pendingSessions.delete(sessionId);
+        await browser.close();
+        
+        return res.json({
+          success: true,
+          message: 'Login successful! Cookies saved.',
+          cookiesCount: cookies.length
+        });
+      }
+      
+      if (detected.step === 'EMAIL' && credentials.email) {
+        console.log(`[${sessionId}] 📧 Entering email...`);
+        await fillInput(page, detected.selector, credentials.email);
+        await clickNext(page);
+        continue;
+      }
+      
+      if (detected.step === 'OTP' && credentials.otp) {
+        console.log(`[${sessionId}] 🔢 Entering OTP...`);
+        await fillInput(page, detected.selector, credentials.otp);
+        await clickNext(page);
+        continue;
+      }
+      
+      if (detected.step === 'PASSWORD') {
+        console.log(`[${sessionId}] 🔐 Entering password...`);
+        await fillInput(page, detected.selector, credentials.password);
+        await clickNext(page);
+        continue;
+      }
+      
+      if (detected.step === 'USERNAME') {
+        console.log(`[${sessionId}] 👤 Entering username...`);
+        await fillInput(page, detected.selector, credentials.username);
+        await clickNext(page);
+        continue;
+      }
+      
+      if (detected.step === 'EMAIL' && !credentials.email) {
+        return res.json({
+          success: false,
+          needsEmail: true,
+          sessionId: sessionId,
+          message: 'Still need email - please provide'
+        });
+      }
+      
+      if (detected.step === 'OTP' && !credentials.otp) {
+        return res.json({
+          success: false,
+          needsOTP: true,
+          sessionId: sessionId,
+          message: 'Still need OTP - please provide'
+        });
+      }
+      
+      if (detected.step === 'UNKNOWN') {
+        return res.json({
+          success: false,
+          unknownStep: true,
+          pageText: detected.pageText,
+          message: 'Unexpected page state'
+        });
+      }
+      
+      await page.waitForTimeout(2000);
     }
-
-    // Verify login
-    const isLoggedIn = await page.evaluate(() => {
-      return document.querySelector('[data-testid="SideNav_NewTweet_Button"]') !== null;
-    });
-
-    if (!isLoggedIn) {
-      throw new Error('Login failed after OTP');
-    }
-
-    console.log(`[${sessionId}] Login successful! Saving cookies...`);
-    const cookies = await page.cookies();
-    await saveCookies(cookies);
-
-    // Clean up
-    pendingOTPSessions.delete(sessionId);
+    
+    pendingSessions.delete(sessionId);
     await browser.close();
-
-    res.json({
-      success: true,
-      message: 'OTP verified and login successful! Cookies saved.',
-      cookiesCount: cookies.length
+    return res.status(500).json({
+      success: false,
+      error: 'Max steps exceeded during continuation'
     });
 
   } catch (error) {
-    console.error(`[${sessionId}] OTP verification error:`, error.message);
-    pendingOTPSessions.delete(sessionId);
+    console.error(`[${sessionId}] ❌ Continuation error:`, error.message);
+    pendingSessions.delete(sessionId);
     await browser.close();
     
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: error.message
     });
   }
 });
 
-// Check if session is valid
+// Check session validity
 app.get('/check-session', async (req, res) => {
   const cookies = await loadCookies();
   
@@ -371,7 +447,7 @@ app.get('/check-session', async (req, res) => {
     return res.json({
       success: false,
       hasSession: false,
-      message: 'No saved cookies found. Please login first.'
+      message: 'No saved cookies'
     });
   }
 
@@ -384,130 +460,102 @@ app.get('/check-session', async (req, res) => {
 
     const page = await browser.newPage();
     await page.setCookie(...cookies);
-    await page.goto('https://twitter.com/home', { waitUntil: 'networkidle0', timeout: 30000 });
-
-    const isLoggedIn = await page.evaluate(() => {
-      return document.querySelector('[data-testid="SideNav_NewTweet_Button"]') !== null;
+    await page.goto('https://twitter.com/home', { 
+      waitUntil: 'networkidle0', 
+      timeout: 30000 
     });
 
+    const isLoggedIn = await page.$('[data-testid="SideNav_NewTweet_Button"]') !== null;
     await browser.close();
 
     res.json({
       success: true,
       hasSession: true,
       isValid: isLoggedIn,
-      message: isLoggedIn ? 'Session is valid' : 'Session expired - please login again'
+      message: isLoggedIn ? 'Session valid ✅' : 'Session expired ❌'
     });
 
   } catch (error) {
     if (browser) await browser.close();
     res.json({
       success: false,
-      hasSession: true,
-      isValid: false,
       error: error.message
     });
   }
 });
 
-// Logout - clear cookies
+// Logout
 app.delete('/logout', async (req, res) => {
   try {
     await fs.unlink(COOKIES_PATH);
-    res.json({
-      success: true,
-      message: 'Cookies deleted successfully'
-    });
+    res.json({ success: true, message: 'Cookies deleted' });
   } catch (error) {
-    res.json({
-      success: true,
-      message: 'No cookies to delete'
-    });
+    res.json({ success: true, message: 'No cookies to delete' });
   }
 });
 
-// Post tweet using saved cookies
+// Post tweet with cookies
 app.post('/post-tweet', async (req, res) => {
   const { tweetText } = req.body;
 
   if (!tweetText) {
     return res.status(400).json({
       success: false,
-      error: 'Missing tweetText in request body'
+      error: 'Missing tweetText'
     });
   }
 
   const cookies = await loadCookies();
-  
   if (!cookies) {
     return res.status(401).json({
       success: false,
-      error: 'No session found. Please login first using POST /login'
+      error: 'No session - please login first'
     });
   }
 
   let browser;
-  
   try {
-    console.log('Posting tweet with saved cookies...');
+    console.log('📤 Posting tweet with cookies...');
     
     browser = await puppeteer.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1920, height: 1080 });
-    
-    // Load cookies
     await page.setCookie(...cookies);
     
-    // Go directly to home page
-    console.log('Loading Twitter home...');
     await page.goto('https://twitter.com/home', { 
       waitUntil: 'networkidle0',
       timeout: 60000 
     });
-    await page.waitForTimeout(3000);
 
-    // Check if still logged in
-    const isLoggedIn = await page.evaluate(() => {
-      return document.querySelector('[data-testid="SideNav_NewTweet_Button"]') !== null;
-    });
-
+    const isLoggedIn = await page.$('[data-testid="SideNav_NewTweet_Button"]') !== null;
     if (!isLoggedIn) {
       await browser.close();
       return res.status(401).json({
         success: false,
-        error: 'Session expired. Please login again using POST /login'
+        error: 'Session expired - please re-login'
       });
     }
 
-    // Click Tweet button
-    console.log('Opening tweet composer...');
     await page.click('[data-testid="SideNav_NewTweet_Button"]');
     await page.waitForTimeout(2000);
-
-    // Type tweet
-    console.log('Typing tweet...');
-    await page.waitForSelector('[data-testid="tweetTextarea_0"]', { timeout: 10000 });
+    
     await page.type('[data-testid="tweetTextarea_0"]', tweetText, { delay: 50 });
     await page.waitForTimeout(2000);
-
-    // Post tweet
-    console.log('Posting tweet...');
+    
     await page.click('[data-testid="tweetButtonInline"]');
     await page.waitForTimeout(4000);
 
-    // Verify success
-    const finalPageText = await page.evaluate(() => document.body.innerText);
-    const isPosted = finalPageText.includes('Your post was sent') || 
-                    finalPageText.includes('Your Tweet was sent');
+    const finalText = await page.evaluate(() => document.body.innerText);
+    const isPosted = finalText.includes('Your post was sent') || 
+                    finalText.includes('Your Tweet was sent');
 
     await browser.close();
 
     if (isPosted) {
-      console.log('Tweet posted successfully!');
+      console.log('✅ Tweet posted!');
       return res.json({
         success: true,
         message: 'Tweet posted successfully',
@@ -516,12 +564,12 @@ app.post('/post-tweet', async (req, res) => {
     } else {
       return res.status(500).json({
         success: false,
-        error: 'Could not confirm tweet was posted'
+        error: 'Could not confirm post'
       });
     }
 
   } catch (error) {
-    console.error('Post tweet error:', error);
+    console.error('❌ Post error:', error.message);
     if (browser) await browser.close();
     
     return res.status(500).json({
@@ -532,6 +580,7 @@ app.post('/post-tweet', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Twitter Puppeteer Service v2.0 running on port ${PORT}`);
-  console.log('Cookie-based authentication enabled');
+  console.log(`\n🚀 Twitter Automation Service v3.0`);
+  console.log(`📡 Running on port ${PORT}`);
+  console.log(`✨ Adaptive login with dynamic flow detection\n`);
 });
