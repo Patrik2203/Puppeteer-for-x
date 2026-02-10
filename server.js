@@ -16,25 +16,34 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const COOKIES_PATH = path.join(__dirname, "twitter-cookies.json");
+const COOKIES_PATH = process.env.COOKIES_PATH
+  ? path.resolve(process.env.COOKIES_PATH)
+  : path.join(__dirname, "twitter-cookies.json");
 
 // ============================================
 // HARDCODED CREDENTIALS - CHANGE THESE
 // ============================================
-const TWITTER_USERNAME = "pratiksha_69";
-const TWITTER_PASSWORD = "Pratik@2203";
-const TWITTER_EMAIL = "ps15august1947@gmail.com";
+const TWITTER_USERNAME = process.env.TWITTER_USERNAME || "pratiksha_69";
+const TWITTER_PASSWORD = process.env.TWITTER_PASSWORD || "Pratik@2203";
+const TWITTER_EMAIL = process.env.TWITTER_EMAIL || "ps15august1947@gmail.com";
+
 // ============================================
 
 // In-memory storage for pending sessions
 const pendingSessions = new Map();
 
+function isRailway() {
+  return (
+    process.env.RAILWAY_ENVIRONMENT !== undefined ||
+    process.env.NODE_ENV === "production"
+  );
+}
+
 // Load/Save cookies
 async function saveCookies(cookies) {
   await fs.writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2));
   console.log("✅ Cookies saved to file");
-  
-  // Also save to env variable backup (for Railway)
+
   if (isRailway()) {
     console.log("💾 Cookies also stored in memory");
     process.env.TWITTER_COOKIES_BACKUP = JSON.stringify(cookies);
@@ -46,7 +55,6 @@ async function loadCookies() {
     const cookiesString = await fs.readFile(COOKIES_PATH, "utf8");
     return JSON.parse(cookiesString);
   } catch (error) {
-    // Fallback to env variable on Railway
     if (isRailway() && process.env.TWITTER_COOKIES_BACKUP) {
       console.log("📂 Loading cookies from backup");
       return JSON.parse(process.env.TWITTER_COOKIES_BACKUP);
@@ -55,16 +63,25 @@ async function loadCookies() {
   }
 }
 
-
-// Helper function to detect environment
-function isRailway() {
-  return process.env.RAILWAY_ENVIRONMENT !== undefined || process.env.NODE_ENV === 'production';
+function createBrowser() {
+  return puppeteer.launch({
+    headless: "new",
+    executablePath: isRailway()
+      ? process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium-browser"
+      : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--window-size=1920,1080",
+      "--disable-gpu",
+      "--single-process",
+    ],
+    ignoreDefaultArgs: ["--enable-automation"],
+  });
 }
-
-// async function saveCookies(cookies) {
-//   await fs.writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2));
-//   console.log("✅ Cookies saved");
-// }
 
 // Improved detection with better selectors
 async function detectCurrentStep(page) {
@@ -368,7 +385,9 @@ async function fillInputAndProceed(page, selector, value, fieldName = "field") {
   if (!pageChanged) {
     console.log(`   ⚠️  WARNING: Page content did not change!`);
     // Take debug screenshot
-    await page.screenshot({ path: `debug-stuck-${fieldName}.png` });
+    if (process.env.NODE_ENV !== "production") {
+      await page.screenshot({ path: `debug-step-${currentStep}.png` });
+    }
   }
 
   await page.waitForTimeout(2000);
@@ -435,24 +454,8 @@ app.post("/login", async (req, res) => {
     console.log(`[${sessionId}] 👤 Username: ${username}`);
     console.log(`[${sessionId}] 📧 Email: ${email}`);
 
-// Use this in ALL your launch() calls
-browser = await puppeteer.launch({
-  headless: "new",
-  executablePath: isRailway() 
-    ? process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser'
-    : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  args: [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--window-size=1920,1080",
-    "--disable-gpu", // Important for Railway
-    "--single-process", // Helps with memory
-  ],
-  ignoreDefaultArgs: ["--enable-automation"],
-});
+    // Use this in ALL your launch() calls
+    browser = await createBrowser();
 
     const page = await browser.newPage();
     await page.setExtraHTTPHeaders({
@@ -490,10 +493,12 @@ browser = await puppeteer.launch({
       console.log(`[${sessionId}] ➡️  Detected: ${detected.step}`);
 
       // Take screenshot for debugging
-      await page.screenshot({ path: `debug-step-${currentStep}.png` });
-      console.log(
-        `[${sessionId}] 📸 Screenshot: debug-step-${currentStep}.png`,
-      );
+      if (process.env.NODE_ENV !== "production") {
+        await page.screenshot({ path: `debug-step-${currentStep}.png` });
+        console.log(
+          `[${sessionId}] 📸 Screenshot: debug-step-${currentStep}.png`,
+        );
+      }
 
       if (detected.step === "LOGGED_IN") {
         console.log(`[${sessionId}] ✅ Login successful!`);
@@ -770,24 +775,8 @@ app.get("/check-session", async (req, res) => {
 
   let browser;
   try {
-// Use this in ALL your launch() calls
-browser = await puppeteer.launch({
-  headless: "new",
-  executablePath: isRailway() 
-    ? process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser'
-    : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  args: [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--window-size=1920,1080",
-    "--disable-gpu", // Important for Railway
-    "--single-process", // Helps with memory
-  ],
-  ignoreDefaultArgs: ["--enable-automation"],
-});
+    // Use this in ALL your launch() calls
+    browser = await createBrowser();
 
     const page = await browser.newPage();
     await page.setCookie(...cookies);
@@ -868,24 +857,8 @@ app.post("/post-tweet", async (req, res) => {
     console.log("\n📤 === POSTING TWEET ===");
     console.log("Tweet:", tweetText);
 
-// Use this in ALL your launch() calls
-browser = await puppeteer.launch({
-  headless: "new",
-  executablePath: isRailway() 
-    ? process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser'
-    : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  args: [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--window-size=1920,1080",
-    "--disable-gpu", // Important for Railway
-    "--single-process", // Helps with memory
-  ],
-  ignoreDefaultArgs: ["--enable-automation"],
-});
+    // Use this in ALL your launch() calls
+    browser = await createBrowser();
 
     const page = await browser.newPage();
     await page.setCookie(...cookies);
