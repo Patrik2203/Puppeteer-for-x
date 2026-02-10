@@ -65,7 +65,7 @@ async function loadCookies() {
 
 function createBrowser() {
   return puppeteer.launch({
-    headless: false,  // or "new" for headless
+    headless: "new",  // or "new" for headless
     executablePath: isRailway()
       ? process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium-browser"
       : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
