@@ -65,7 +65,7 @@ async function loadCookies() {
 
 function createBrowser() {
   return puppeteer.launch({
-    headless: "new",
+    headless: false,  // or "new" for headless
     executablePath: isRailway()
       ? process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium-browser"
       : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -77,9 +77,12 @@ function createBrowser() {
       "--disable-features=IsolateOrigins,site-per-process",
       "--window-size=1920,1080",
       "--disable-gpu",
-      "--single-process",
+      // REMOVE --single-process when headless: false
+      // ...(isRailway() ? ["--single-process"] : []),
     ],
     ignoreDefaultArgs: ["--enable-automation"],
+    defaultViewport: null,  // ADD THIS - prevents viewport issues
+    // waitForInitialPage: false,  // Try this if still failing
   });
 }
 
