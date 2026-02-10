@@ -169,10 +169,31 @@ app.post('/post-tweet', async (req, res) => {
     });
     await page.waitForTimeout(4000);
 
-    // Check for phone verification
+    // Check for phone/username verification step
     const pageText = await page.evaluate(() => document.body.innerText);
-    if (pageText.includes('Enter your phone number') || pageText.includes('Verify your identity')) {
-      throw new Error('Twitter requires phone verification. Please login manually once first.');
+    console.log('Checking for verification prompts...');
+    
+    if (pageText.includes('Enter your phone number') || pageText.includes('Enter your email')) {
+      console.log('Phone/email verification detected - entering username again...');
+      try {
+        const verificationInput = await page.waitForSelector('input[data-testid="ocfEnterTextTextInput"]', { timeout: 5000 });
+        await verificationInput.type(username, { delay: 100 });
+        await page.waitForTimeout(1000);
+        
+        // Click Next again
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
+          const nextButton = buttons.find(btn => btn.textContent && btn.textContent.includes('Next'));
+          if (nextButton) nextButton.click();
+        });
+        await page.waitForTimeout(4000);
+      } catch (e) {
+        console.log('Could not handle verification - may need manual login first');
+      }
+    }
+    
+    if (pageText.includes('Verify your identity') || pageText.includes('unusual login activity')) {
+      throw new Error('Twitter requires manual verification. Please login to your Twitter account manually once from a browser, then try again.');
     }
 
     // Enter password
